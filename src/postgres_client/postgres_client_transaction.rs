@@ -10,7 +10,7 @@ use {
     postgres::{Client, Statement},
     postgres_types::{FromSql, ToSql},
     solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPluginError, ReplicaTransactionInfo,
+        GeyserPluginError, ReplicaTransactionInfoV2,
     },
     solana_runtime::bank::RewardType,
     solana_sdk::{
@@ -53,7 +53,7 @@ pub struct DbTransactionTokenBalance {
     pub owner: String,
 }
 
-#[derive(Clone, Debug, FromSql, ToSql, PartialEq)]
+#[derive(Clone, Debug, Eq, FromSql, ToSql, PartialEq)]
 #[postgres(name = "RewardType")]
 pub enum DbRewardType {
     Fee,
@@ -149,6 +149,7 @@ pub struct DbTransaction {
     /// Given a slot, the transaction with a smaller write_version appears
     /// before transactions with higher write_versions in a shred.
     pub write_version: i64,
+    pub index: i64,
 }
 
 pub struct LogTransactionRequest {
@@ -275,7 +276,7 @@ impl From<&InnerInstructions> for DbInnerInstructions {
             instructions: instructions
                 .instructions
                 .iter()
-                .map(DbCompiledInstruction::from)
+                .map(|instruction| DbCompiledInstruction::from(&instruction.instruction))
                 .collect(),
         }
     }
@@ -300,7 +301,7 @@ impl From<&Reward> for DbReward {
     fn from(reward: &Reward) -> Self {
         Self {
             pubkey: reward.pubkey.clone(),
-            lamports: reward.lamports as i64,
+            lamports: reward.lamports,
             post_balance: reward.post_balance as i64,
             reward_type: get_reward_type(&reward.reward_type),
             commission: reward
@@ -311,7 +312,7 @@ impl From<&Reward> for DbReward {
     }
 }
 
-#[derive(Clone, Debug, FromSql, ToSql, PartialEq)]
+#[derive(Clone, Debug, Eq, FromSql, ToSql, PartialEq)]
 #[postgres(name = "TransactionErrorCode")]
 pub enum DbTransactionErrorCode {
     AccountInUse,
@@ -347,6 +348,11 @@ pub enum DbTransactionErrorCode {
     WouldExceedAccountDataTotalLimit,
     DuplicateInstruction,
     InsufficientFundsForRent,
+    MaxLoadedAccountsDataSizeExceeded,
+    InvalidLoadedAccountsDataSizeLimit,
+    ResanitizationNeeded,
+    UnbalancedTransaction,
+    ProgramExecutionTemporarilyRestricted,
 }
 
 impl From<&TransactionError> for DbTransactionErrorCode {
@@ -396,11 +402,22 @@ impl From<&TransactionError> for DbTransactionErrorCode {
             TransactionError::InsufficientFundsForRent { account_index: _ } => {
                 Self::InsufficientFundsForRent
             }
+            TransactionError::MaxLoadedAccountsDataSizeExceeded => {
+                Self::MaxLoadedAccountsDataSizeExceeded
+            }
+            TransactionError::InvalidLoadedAccountsDataSizeLimit => {
+                Self::InvalidLoadedAccountsDataSizeLimit
+            }
+            TransactionError::ResanitizationNeeded => Self::ResanitizationNeeded,
+            TransactionError::UnbalancedTransaction => Self::UnbalancedTransaction,
+            TransactionError::ProgramExecutionTemporarilyRestricted { account_index: _ } => {
+                Self::ProgramExecutionTemporarilyRestricted
+            }
         }
     }
 }
 
-#[derive(Clone, Debug, FromSql, ToSql, PartialEq)]
+#[derive(Clone, Debug, Eq, FromSql, ToSql, PartialEq)]
 #[postgres(name = "TransactionError")]
 pub struct DbTransactionError {
     error_code: DbTransactionErrorCode,
@@ -487,7 +504,7 @@ impl From<&TransactionStatusMeta> for DbTransactionStatusMeta {
 
 fn build_db_transaction(
     slot: u64,
-    transaction_info: &ReplicaTransactionInfo,
+    transaction_info: &ReplicaTransactionInfoV2,
     transaction_write_version: u64,
 ) -> DbTransaction {
     DbTransaction {
@@ -500,7 +517,7 @@ fn build_db_transaction(
         },
         legacy_message: match transaction_info.transaction.message() {
             SanitizedMessage::Legacy(legacy_message) => {
-                Some(DbTransactionMessage::from(legacy_message))
+                Some(DbTransactionMessage::from(legacy_message.message.as_ref()))
             }
             _ => None,
         },
@@ -521,6 +538,7 @@ fn build_db_transaction(
             .to_vec(),
         meta: DbTransactionStatusMeta::from(transaction_info.transaction_status_meta),
         write_version: transaction_write_version as i64,
+        index: transaction_info.index as i64,
     }
 }
 
@@ -530,8 +548,8 @@ impl SimplePostgresClient {
         config: &GeyserPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
         let stmt = "INSERT INTO transaction AS txn (signature, is_vote, slot, message_type, legacy_message, \
-        v0_loaded_message, signatures, message_hash, meta, write_version, updated_on) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+        v0_loaded_message, signatures, message_hash, meta, write_version, index, updated_on) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
         ON CONFLICT (slot, signature) DO UPDATE SET is_vote=excluded.is_vote, \
         message_type=excluded.message_type, \
         legacy_message=excluded.legacy_message, \
@@ -540,18 +558,19 @@ impl SimplePostgresClient {
         message_hash=excluded.message_hash, \
         meta=excluded.meta, \
         write_version=excluded.write_version, \
+        index=excluded.index,
         updated_on=excluded.updated_on";
 
         let stmt = client.prepare(stmt);
 
         match stmt {
             Err(err) => {
-                return Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the transaction update PostgreSQL database: ({}) host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })));
+                })))
             }
             Ok(stmt) => Ok(stmt),
         }
@@ -580,6 +599,7 @@ impl SimplePostgresClient {
                 &transaction_info.message_hash,
                 &transaction_info.meta,
                 &transaction_info.write_version,
+                &transaction_info.index,
                 &updated_on,
             ],
         );
@@ -600,7 +620,7 @@ impl SimplePostgresClient {
 impl ParallelPostgresClient {
     fn build_transaction_request(
         slot: u64,
-        transaction_info: &ReplicaTransactionInfo,
+        transaction_info: &ReplicaTransactionInfoV2,
         transaction_write_version: u64,
     ) -> LogTransactionRequest {
         LogTransactionRequest {
@@ -613,8 +633,8 @@ impl ParallelPostgresClient {
     }
 
     pub fn log_transaction_info(
-        &mut self,
-        transaction_info: &ReplicaTransactionInfo,
+        &self,
+        transaction_info: &ReplicaTransactionInfoV2,
         slot: u64,
     ) -> Result<(), GeyserPluginError> {
         self.transaction_write_version
@@ -649,6 +669,7 @@ pub(crate) mod tests {
                 SanitizedTransaction, SimpleAddressLoader, Transaction, VersionedTransaction,
             },
         },
+        solana_transaction_status::InnerInstruction,
     };
 
     fn check_compiled_instruction_equality(
@@ -677,7 +698,7 @@ pub(crate) mod tests {
         for i in 0..compiled_instruction.data.len() {
             assert_eq!(
                 compiled_instruction.data[i],
-                db_compiled_instruction.data[i] as u8
+                db_compiled_instruction.data[i]
             )
         }
     }
@@ -706,7 +727,7 @@ pub(crate) mod tests {
 
         for i in 0..inner_instructions.instructions.len() {
             check_compiled_instruction_equality(
-                &inner_instructions.instructions[i],
+                &inner_instructions.instructions[i].instruction,
                 &db_inner_instructions.instructions[i],
             )
         }
@@ -717,15 +738,21 @@ pub(crate) mod tests {
         let inner_instructions = InnerInstructions {
             index: 0,
             instructions: vec![
-                CompiledInstruction {
-                    program_id_index: 0,
-                    accounts: vec![1, 2, 3],
-                    data: vec![4, 5, 6],
+                InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 0,
+                        accounts: vec![1, 2, 3],
+                        data: vec![4, 5, 6],
+                    },
+                    stack_height: None,
                 },
-                CompiledInstruction {
-                    program_id_index: 1,
-                    accounts: vec![12, 13, 14],
-                    data: vec![24, 25, 26],
+                InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 1,
+                        accounts: vec![12, 13, 14],
+                        data: vec![24, 25, 26],
+                    },
+                    stack_height: None,
                 },
             ],
         };
@@ -836,6 +863,7 @@ pub(crate) mod tests {
                 ui_amount_string: "0.42".to_string(),
             },
             owner: Pubkey::new_unique().to_string(),
+            program_id: "program_id".to_string(),
         };
 
         let db_transaction_token_balance =
@@ -991,15 +1019,21 @@ pub(crate) mod tests {
             inner_instructions: Some(vec![InnerInstructions {
                 index: 0,
                 instructions: vec![
-                    CompiledInstruction {
-                        program_id_index: 0,
-                        accounts: vec![1, 2, 3],
-                        data: vec![4, 5, 6],
+                    InnerInstruction {
+                        instruction: CompiledInstruction {
+                            program_id_index: 0,
+                            accounts: vec![1, 2, 3],
+                            data: vec![4, 5, 6],
+                        },
+                        stack_height: None,
                     },
-                    CompiledInstruction {
-                        program_id_index: 1,
-                        accounts: vec![12, 13, 14],
-                        data: vec![24, 25, 26],
+                    InnerInstruction {
+                        instruction: CompiledInstruction {
+                            program_id_index: 1,
+                            accounts: vec![12, 13, 14],
+                            data: vec![24, 25, 26],
+                        },
+                        stack_height: None,
                     },
                 ],
             }]),
@@ -1015,6 +1049,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.42".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
+                    program_id: "program_id".to_string(),
                 },
                 TransactionTokenBalance {
                     account_index: 2,
@@ -1026,6 +1061,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.38".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
+                    program_id: "program_id".to_string(),
                 },
             ]),
             post_token_balances: Some(vec![
@@ -1039,6 +1075,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.82".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
+                    program_id: "program_id".to_string(),
                 },
                 TransactionTokenBalance {
                     account_index: 2,
@@ -1050,6 +1087,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.48".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
+                    program_id: "program_id".to_string(),
                 },
             ]),
             rewards: Some(vec![
@@ -1072,6 +1110,8 @@ pub(crate) mod tests {
                 writable: vec![Pubkey::new_unique(), Pubkey::new_unique()],
                 readonly: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             },
+            return_data: None,
+            compute_units_consumed: None,
         }
     }
 
@@ -1288,7 +1328,7 @@ pub(crate) mod tests {
 
     fn check_transaction(
         slot: u64,
-        transaction: &ReplicaTransactionInfo,
+        transaction: &ReplicaTransactionInfoV2,
         db_transaction: &DbTransaction,
     ) {
         assert_eq!(transaction.signature.as_ref(), db_transaction.signature);
@@ -1298,7 +1338,7 @@ pub(crate) mod tests {
             SanitizedMessage::Legacy(message) => {
                 assert_eq!(db_transaction.message_type, 0);
                 check_transaction_message_equality(
-                    message,
+                    &message.message,
                     db_transaction.legacy_message.as_ref().unwrap(),
                 );
             }
@@ -1340,7 +1380,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_build_db_transaction_legacy() {
-        let signature = Signature::new(&[1u8; 64]);
+        let signature = Signature::from([1u8; 64]);
 
         let message_hash = Hash::new_unique();
         let transaction = build_test_transaction_legacy();
@@ -1352,16 +1392,16 @@ pub(crate) mod tests {
             message_hash,
             Some(true),
             SimpleAddressLoader::Disabled,
-            false,
         )
         .unwrap();
 
         let transaction_status_meta = build_transaction_status_meta();
-        let transaction_info = ReplicaTransactionInfo {
+        let transaction_info = ReplicaTransactionInfoV2 {
             signature: &signature,
             is_vote: false,
             transaction: &transaction,
             transaction_status_meta: &transaction_status_meta,
+            index: 0,
         };
 
         let slot = 54;
@@ -1372,9 +1412,9 @@ pub(crate) mod tests {
     fn build_test_transaction_v0() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![
-                Signature::new(&[1u8; 64]),
-                Signature::new(&[2u8; 64]),
-                Signature::new(&[3u8; 64]),
+                Signature::from([1u8; 64]),
+                Signature::from([2u8; 64]),
+                Signature::from([3u8; 64]),
             ],
             message: VersionedMessage::V0(build_transaction_message_v0()),
         }
@@ -1382,12 +1422,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_build_db_transaction_v0() {
-        let signature = Signature::new(&[1u8; 64]);
+        let signature = Signature::from([1u8; 64]);
 
         let message_hash = Hash::new_unique();
         let transaction = build_test_transaction_v0();
 
-        transaction.sanitize(false).unwrap();
+        transaction.sanitize().unwrap();
 
         let transaction = SanitizedTransaction::try_create(
             transaction,
@@ -1397,16 +1437,16 @@ pub(crate) mod tests {
                 writable: vec![Pubkey::new_unique(), Pubkey::new_unique()],
                 readonly: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             }),
-            false,
         )
         .unwrap();
 
         let transaction_status_meta = build_transaction_status_meta();
-        let transaction_info = ReplicaTransactionInfo {
+        let transaction_info = ReplicaTransactionInfoV2 {
             signature: &signature,
             is_vote: true,
             transaction: &transaction,
             transaction_status_meta: &transaction_status_meta,
+            index: 0,
         };
 
         let slot = 54;

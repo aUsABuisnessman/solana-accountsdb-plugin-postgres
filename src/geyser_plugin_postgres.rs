@@ -24,6 +24,7 @@ pub struct GeyserPluginPostgres {
     client: Option<ParallelPostgresClient>,
     accounts_selector: Option<AccountsSelector>,
     transaction_selector: Option<TransactionSelector>,
+    batch_starting_slot: Option<u64>,
 }
 
 impl std::fmt::Debug for GeyserPluginPostgres {
@@ -33,7 +34,7 @@ impl std::fmt::Debug for GeyserPluginPostgres {
 }
 
 /// The Configuration for the PostgreSQL plugin
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GeyserPluginPostgresConfig {
     /// The host name or IP of the PostgreSQL server
     pub host: Option<String>,
@@ -81,6 +82,11 @@ pub struct GeyserPluginPostgresConfig {
 
     /// Controls whetherf to index the token mints. The default is false
     pub index_token_mint: Option<bool>,
+
+    /// Controls if this plugin can read the database on_load() to find heighest slot
+    /// and ignore upsetr accounts (at_startup) that should already exist in DB
+    #[serde(default)]
+    pub skip_upsert_existing_accounts_at_startup: bool,
 }
 
 #[derive(Error, Debug)]
@@ -177,22 +183,20 @@ impl GeyserPlugin for GeyserPluginPostgres {
         self.accounts_selector = Some(Self::create_accounts_selector_from_config(&result));
         self.transaction_selector = Some(Self::create_transaction_selector_from_config(&result));
 
-        let result: serde_json::Result<GeyserPluginPostgresConfig> =
-            serde_json::from_str(&contents);
-        match result {
-            Err(err) => {
-                return Err(GeyserPluginError::ConfigFileReadError {
+        let config: GeyserPluginPostgresConfig =
+            serde_json::from_str(&contents).map_err(|err| {
+                GeyserPluginError::ConfigFileReadError {
                     msg: format!(
                         "The config file is not in the JSON format expected: {:?}",
                         err
                     ),
-                })
-            }
-            Ok(config) => {
-                let client = PostgresClientBuilder::build_pararallel_postgres_client(&config)?;
-                self.client = Some(client);
-            }
-        }
+                }
+            })?;
+
+        let (client, batch_optimize_by_skiping_older_slots) =
+            PostgresClientBuilder::build_pararallel_postgres_client(&config)?;
+        self.client = Some(client);
+        self.batch_starting_slot = batch_optimize_by_skiping_older_slots;
 
         Ok(())
     }
@@ -209,11 +213,22 @@ impl GeyserPlugin for GeyserPluginPostgres {
     }
 
     fn update_account(
-        &mut self,
+        &self,
         account: ReplicaAccountInfoVersions,
         slot: u64,
         is_startup: bool,
     ) -> Result<()> {
+        // skip updating account on startup of batch_optimize_by_skiping_older_slots
+        // is configured
+        if is_startup
+            && self
+                .batch_starting_slot
+                .map(|slot_limit| slot < slot_limit)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         let mut measure_all = Measure::start("geyser-plugin-postgres-update-account-main");
         match account {
             ReplicaAccountInfoVersions::V0_0_1(_) => {
@@ -221,7 +236,12 @@ impl GeyserPlugin for GeyserPluginPostgres {
                     GeyserPluginPostgresError::ReplicaAccountV001NotSupported,
                 )));
             }
-            ReplicaAccountInfoVersions::V0_0_2(account) => {
+            ReplicaAccountInfoVersions::V0_0_2(_) => {
+                return Err(GeyserPluginError::Custom(Box::new(
+                    GeyserPluginPostgresError::ReplicaAccountV001NotSupported,
+                )));
+            }
+            ReplicaAccountInfoVersions::V0_0_3(account) => {
                 let mut measure_select =
                     Measure::start("geyser-plugin-postgres-update-account-select");
                 if let Some(accounts_selector) = &self.accounts_selector {
@@ -247,7 +267,7 @@ impl GeyserPlugin for GeyserPluginPostgres {
                     self.accounts_selector.as_ref().unwrap()
                 );
 
-                match &mut self.client {
+                match &self.client {
                     None => {
                         return Err(GeyserPluginError::Custom(Box::new(
                             GeyserPluginPostgresError::DataStoreConnectionError {
@@ -291,15 +311,10 @@ impl GeyserPlugin for GeyserPluginPostgres {
         Ok(())
     }
 
-    fn update_slot_status(
-        &mut self,
-        slot: u64,
-        parent: Option<u64>,
-        status: SlotStatus,
-    ) -> Result<()> {
+    fn update_slot_status(&self, slot: u64, parent: Option<u64>, status: SlotStatus) -> Result<()> {
         info!("Updating slot {:?} at with status {:?}", slot, status);
 
-        match &mut self.client {
+        match &self.client {
             None => {
                 return Err(GeyserPluginError::Custom(Box::new(
                     GeyserPluginPostgresError::DataStoreConnectionError {
@@ -321,9 +336,9 @@ impl GeyserPlugin for GeyserPluginPostgres {
         Ok(())
     }
 
-    fn notify_end_of_startup(&mut self) -> Result<()> {
+    fn notify_end_of_startup(&self) -> Result<()> {
         info!("Notifying the end of startup for accounts notifications");
-        match &mut self.client {
+        match &self.client {
             None => {
                 return Err(GeyserPluginError::Custom(Box::new(
                     GeyserPluginPostgresError::DataStoreConnectionError {
@@ -345,11 +360,11 @@ impl GeyserPlugin for GeyserPluginPostgres {
     }
 
     fn notify_transaction(
-        &mut self,
+        &self,
         transaction_info: ReplicaTransactionInfoVersions,
         slot: u64,
     ) -> Result<()> {
-        match &mut self.client {
+        match &self.client {
             None => {
                 return Err(GeyserPluginError::Custom(Box::new(
                     GeyserPluginPostgresError::DataStoreConnectionError {
@@ -358,7 +373,7 @@ impl GeyserPlugin for GeyserPluginPostgres {
                 )));
             }
             Some(client) => match transaction_info {
-                ReplicaTransactionInfoVersions::V0_0_1(transaction_info) => {
+                ReplicaTransactionInfoVersions::V0_0_2(transaction_info) => {
                     if let Some(transaction_selector) = &self.transaction_selector {
                         if !transaction_selector.is_transaction_selected(
                             transaction_info.is_vote,
@@ -378,14 +393,19 @@ impl GeyserPlugin for GeyserPluginPostgres {
                             });
                     }
                 }
+                _ => {
+                    return Err(GeyserPluginError::SlotStatusUpdateError{
+                        msg: "Failed to persist the transaction info to the PostgreSQL database. Unsupported format.".to_string()
+                    });
+                }
             },
         }
 
         Ok(())
     }
 
-    fn notify_block_metadata(&mut self, block_info: ReplicaBlockInfoVersions) -> Result<()> {
-        match &mut self.client {
+    fn notify_block_metadata(&self, block_info: ReplicaBlockInfoVersions) -> Result<()> {
+        match &self.client {
             None => {
                 return Err(GeyserPluginError::Custom(Box::new(
                     GeyserPluginPostgresError::DataStoreConnectionError {
@@ -394,7 +414,7 @@ impl GeyserPlugin for GeyserPluginPostgres {
                 )));
             }
             Some(client) => match block_info {
-                ReplicaBlockInfoVersions::V0_0_1(block_info) => {
+                ReplicaBlockInfoVersions::V0_0_3(block_info) => {
                     let result = client.update_block_metadata(block_info);
 
                     if let Err(err) = result {
@@ -402,6 +422,16 @@ impl GeyserPlugin for GeyserPluginPostgres {
                                 msg: format!("Failed to persist the update of block metadata to the PostgreSQL database. Error: {:?}", err)
                             });
                     }
+                }
+                ReplicaBlockInfoVersions::V0_0_2(_block_info) => {
+                    return Err(GeyserPluginError::SlotStatusUpdateError{
+                        msg: "Failed to persist the transaction info to the PostgreSQL database. Unsupported format.".to_string()
+                    });
+                }
+                ReplicaBlockInfoVersions::V0_0_1(_) => {
+                    return Err(GeyserPluginError::SlotStatusUpdateError{
+                        msg: "Failed to persist the transaction info to the PostgreSQL database. Unsupported format.".to_string()
+                    });
                 }
             },
         }

@@ -64,7 +64,12 @@ Create TYPE "TransactionErrorCode" AS ENUM (
     'WouldExceedAccountDataBlockLimit',
     'WouldExceedAccountDataTotalLimit',
     'DuplicateInstruction',
-    'InsufficientFundsForRent'
+    'InsufficientFundsForRent',
+    'MaxLoadedAccountsDataSizeExceeded',
+    'InvalidLoadedAccountsDataSizeLimit',
+    'ResanitizationNeeded',
+    'UnbalancedTransaction',
+    'ProgramExecutionTemporarilyRestricted'
 );
 
 CREATE TYPE "TransactionError" AS (
@@ -167,6 +172,7 @@ CREATE TABLE transaction (
     meta "TransactionStatusMeta",
     write_version BIGINT,
     updated_on TIMESTAMP NOT NULL,
+    index BIGINT NOT NULL,
     CONSTRAINT transaction_pk PRIMARY KEY (slot, signature)
 );
 

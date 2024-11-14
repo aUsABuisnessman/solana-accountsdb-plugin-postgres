@@ -9,7 +9,7 @@ use {
     log::*,
     postgres::{Client, Statement},
     solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPluginError, ReplicaBlockInfo,
+        GeyserPluginError, ReplicaBlockInfoV3,
     },
 };
 
@@ -22,8 +22,8 @@ pub struct DbBlockInfo {
     pub block_height: Option<i64>,
 }
 
-impl<'a> From<&ReplicaBlockInfo<'a>> for DbBlockInfo {
-    fn from(block_info: &ReplicaBlockInfo) -> Self {
+impl<'a> From<&ReplicaBlockInfoV3<'a>> for DbBlockInfo {
+    fn from(block_info: &ReplicaBlockInfoV3) -> Self {
         Self {
             slot: block_info.slot as i64,
             blockhash: block_info.blockhash.to_string(),
@@ -43,18 +43,20 @@ impl SimplePostgresClient {
     ) -> Result<Statement, GeyserPluginError> {
         let stmt =
             "INSERT INTO block (slot, blockhash, rewards, block_time, block_height, updated_on) \
-        VALUES ($1, $2, $3, $4, $5, $6)";
+        VALUES ($1, $2, $3, $4, $5, $6) \
+        ON CONFLICT (slot) DO UPDATE SET blockhash=excluded.blockhash, rewards=excluded.rewards, \
+        block_time=excluded.block_time, block_height=excluded.block_height, updated_on=excluded.updated_on";
 
         let stmt = client.prepare(stmt);
 
         match stmt {
             Err(err) => {
-                return Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the block metadata update PostgreSQL database: ({}) host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })));
+                })))
             }
             Ok(stmt) => Ok(stmt),
         }
